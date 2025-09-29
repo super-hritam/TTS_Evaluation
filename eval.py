@@ -10,7 +10,6 @@ import pandas as pd
 from jiwer import wer
 import logging
 from elevenlabs import ElevenLabs, VoiceSettings
-import numpy as np
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -19,11 +18,10 @@ logger = logging.getLogger("tts_evaluation")
 # Initialize ElevenLabs client with environment variable
 elevenlabs_client = ElevenLabs(
     api_key=os.environ.get("ELEVEN_API_KEY", "<API_KEY>"),
-    base_url="https://api-global-preview.elevenlabs.io"
 )
 
-def elevenlabs_tts(text, voice_id="bIHbv24MWmeRgasZH58o", model_id="eleven_turbo_v2_5", 
-                  voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.5), 
+def elevenlabs_tts(text, voice_id="bIHbv24MWmeRgasZH58o", model_id="eleven_turbo_v2_5",
+                  voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.5),
                   seed=42, output_format="mp3_22050_32"):
     """Generate streaming TTS audio using ElevenLabs."""
     if not os.environ.get("ELEVEN_API_KEY"):
@@ -43,23 +41,19 @@ def elevenlabs_tts(text, voice_id="bIHbv24MWmeRgasZH58o", model_id="eleven_turbo
         raise
 
 def compute_mcd(gt_path, gen_path, n_mfcc=13, sr=22050):
-    """Compute Mel Cepstral Distortion using dtw-python."""
+    """Compute Mel Cepstral Distortion using dtw-python from MP3 files."""
     try:
+        # librosa can load mp3 files directly
         gt_audio, _ = librosa.load(gt_path, sr=sr)
         gen_audio, _ = librosa.load(gen_path, sr=sr)
-        
+
         # Compute MFCCs
         gt_mfcc = librosa.feature.mfcc(y=gt_audio, sr=sr, n_mfcc=n_mfcc)
         gen_mfcc = librosa.feature.mfcc(y=gen_audio, sr=sr, n_mfcc=n_mfcc)
-        
-        # Ensure same length for DTW
-        min_len = min(gt_mfcc.shape[1], gen_mfcc.shape[1])
-        gt_mfcc = gt_mfcc[:, :min_len]
-        gen_mfcc = gen_mfcc[:, :min_len]
-        
+
         # Compute DTW-aligned distance
         dist, _, _, _ = dtw(gt_mfcc.T, gen_mfcc.T, dist=lambda x, y: np.linalg.norm(x - y))
-        mcd = dist / min_len
+        mcd = dist / gen_mfcc.shape[1]
         return mcd
     except Exception as e:
         logger.error(f"Error computing MCD for {gt_path}, {gen_path}: {e}")
@@ -68,257 +62,197 @@ def compute_mcd(gt_path, gen_path, n_mfcc=13, sr=22050):
 def compute_classification_metrics(gt_text, pred_text):
     """Compute TP, FP, FN, TN, precision, recall, and F1 from WER errors."""
     try:
-        measures = compute_measures(gt_text.strip().lower(), pred_text.strip().lower())
-        tp = measures["hits"]  # Correct words (true positives)
-        fp = measures["insertions"]  # Words in pred but not in gt (false positives)
-        fn = measures["deletions"]  # Words in gt but not in pred (false negatives)
-        tn = 0  # Approximate TN as 0 (minimal non-word context in TTS)
-        
-        # Compute precision, recall, F1
+        error = wer(gt_text, pred_text, standardize=True)
+        # In jiwer, hits = S + D + I - error
+        # S = Substitutions, D = Deletions, I = Insertions
+        # TP (hits) = Total words in reference - S - D
+        # So we use the breakdown from jiwer's `wer` function directly.
+        measures = wer(gt_text.strip().lower(), pred_text.strip().lower(),
+                       truth_transform=None, hypothesis_transform=None,
+                       concatenate_texts=False)
+
+        tp = measures.hits
+        fp = measures.insertions
+        fn = measures.deletions
+        tn = 0 # Cannot be computed in this context
+
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-        
-        return {
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "tn": tn,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1
-        }
+
+        return {"tp": tp, "fp": fp, "fn": fn, "tn": tn, "precision": precision, "recall": recall, "f1": f1}
     except Exception as e:
         logger.error(f"Error computing classification metrics: {e}")
-        return {
-            "tp": 0,
-            "fp": 0,
-            "fn": 0,
-            "tn": 0,
-            "precision": 0,
-            "recall": 0,
-            "f1": 0
-        }
+        return {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "precision": 0, "recall": 0, "f1": 0}
 
-# Minimal compute_measures implementation for jiwer compatibility
-def compute_measures(truth, hypothesis):
-    """
-    Returns a dict with 'hits', 'insertions', 'deletions' for two strings.
-    This is a simplified version for word-level comparison.
-    """
-    truth_words = truth.strip().split()
-    hyp_words = hypothesis.strip().split()
-
-    # Levenshtein distance matrix
-    d = np.zeros((len(truth_words)+1, len(hyp_words)+1), dtype=int)
-    for i in range(len(truth_words)+1):
-        d[i][0] = i
-    for j in range(len(hyp_words)+1):
-        d[0][j] = j
-    for i in range(1, len(truth_words)+1):
-        for j in range(1, len(hyp_words)+1):
-            if truth_words[i-1] == hyp_words[j-1]:
-                cost = 0
-            else:
-                cost = 1
-            d[i][j] = min(
-                d[i-1][j] + 1,      # deletion
-                d[i][j-1] + 1,      # insertion
-                d[i-1][j-1] + cost  # substitution
-            )
-    # Backtrack to count hits, insertions, deletions
-    i, j = len(truth_words), len(hyp_words)
-    hits = 0
-    insertions = 0
-    deletions = 0
-    while i > 0 or j > 0:
-        if i > 0 and j > 0 and truth_words[i-1] == hyp_words[j-1]:
-            hits += 1
-            i -= 1
-            j -= 1
-        elif i > 0 and (j == 0 or d[i][j] == d[i-1][j] + 1):
-            deletions += 1
-            i -= 1
-        elif j > 0 and (i == 0 or d[i][j] == d[i][j-1] + 1):
-            insertions += 1
-            j -= 1
-        else:
-            i -= 1
-            j -= 1
-    return {"hits": hits, "insertions": insertions, "deletions": deletions}
 
 def main():
     # Step 1: Setup directories and device
-    output_dir = "generated_audios"
-    gt_dir = "ground_truth_audios"
+    output_dir = "generated_audios_mp3"
+    gt_dir = "ground_truth_audios_mp3"
+    custom_gt_dir = "custom_ground_truth_audios"
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(gt_dir, exist_ok=True)
-    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(custom_gt_dir, exist_ok=True) # Ensure custom dir exists
+    
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
     num_samples = 10  # Number of samples to evaluate
 
-    # Step 2: Load dataset (Only run if dataset is not already downloaded)
+    # Step 2: Load data - either from Hugging Face dataset or local manifest or local files
+    dataset_items = []
+    use_local_gt_files = False  # Set this to True to use local .mp3/.txt files instead of loading dataset
+
     try:
-        dataset = load_dataset("lj_speech", split=f"train[:{num_samples}]")
-        logger.info(f"Loaded dataset with {len(dataset)} samples")
-    except Exception as e:
-        logger.error(
-            f"Error loading dataset: {e}. "
-            "Run 'huggingface-cli delete-cache' or manually download LJSpeech from "
-            "https://huggingface.co/datasets/lj_speech and load with "
-            "load_dataset('/path/to/lj_speech', split='train[:10]')"
-        )
+        # --- TO USE YOUR OWN FILES, COMMENT OUT THE LINE BELOW ---
+        if not use_local_gt_files:
+            dataset = load_dataset("lj_speech", split=f"train[:{num_samples}]")
+        else:
+            dataset = None
+        # ---------------------------------------------------------
+    except Exception:
+        dataset = None
+
+    if dataset:
+        logger.info(f"Loaded dataset with {len(dataset)} samples. Processing...")
+        for i, item in enumerate(dataset):
+            text = item["text"]
+            gt_path = os.path.join(gt_dir, f"gt_sample_{i}.mp3")
+            txt_path = os.path.join(gt_dir, f"gt_sample_{i}.txt")
+            # Save ground-truth audio as MP3 for consistent comparison
+            torchaudio.save(gt_path, torch.tensor(item["audio"]["array"]).unsqueeze(0), 
+                            item["audio"]["sampling_rate"], format="mp3")
+            # Save ground-truth text as .txt
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            dataset_items.append({"text": text, "gt_path": gt_path, "id": i})
+    else:
+        logger.info("Dataset not loaded. Looking for local files in manifest.csv or ground-truth directory...")
+        manifest_path = "manifest.csv"
+        if os.path.exists(manifest_path):
+            manifest = pd.read_csv(manifest_path)
+            for index, row in manifest.iterrows():
+                text = row["text"]
+                audio_filename = row["audio_filename"]
+                gt_path = os.path.join(custom_gt_dir, audio_filename)
+                if not os.path.exists(gt_path):
+                    logger.warning(f"Audio file {gt_path} not found. Skipping.")
+                    continue
+                dataset_items.append({"text": text, "gt_path": gt_path, "id": index})
+        else:
+            # Look for .mp3 and .txt pairs in gt_dir
+            logger.info(f"{manifest_path} not found. Looking for .mp3/.txt pairs in {gt_dir}...")
+            gt_files = [f for f in os.listdir(gt_dir) if f.endswith(".mp3")]
+            for gt_file in gt_files:
+                base = os.path.splitext(gt_file)[0]
+                txt_file = base + ".txt"
+                gt_path = os.path.join(gt_dir, gt_file)
+                txt_path = os.path.join(gt_dir, txt_file)
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8") as f:
+                        text = f.read().strip()
+                    # Extract id from filename if possible
+                    try:
+                        sample_id = int(base.split("_")[-1])
+                    except Exception:
+                        sample_id = base
+                    dataset_items.append({"text": text, "gt_path": gt_path, "id": sample_id})
+                else:
+                    logger.warning(f"Text file {txt_path} not found for audio {gt_path}. Skipping.")
+
+    if not dataset_items:
+        logger.error("No valid samples to process. Exiting.")
         return
 
-    # Step 3: Verify dataset and generate audios
-    tsv_data = []
-    wav_paths = []
-    gt_paths = []
-    valid_samples = []
-    for i, item in enumerate(dataset):
+    # Step 3: Generate audios and prepare for metrics
+    evaluation_data = []
+    for item in dataset_items:
         text = item["text"]
-        audio_path = item.get("audio", {}).get("path")
-        if not audio_path or not os.path.exists(audio_path):
-            logger.warning(f"Skipping sample {i}: Audio file missing at {audio_path}")
-            continue
+        gt_path = item["gt_path"]
+        sample_id = item["id"]
         
-        valid_samples.append((i, item))
-        mp3_path = os.path.join(output_dir, f"sample_{i}.mp3")
-        wav_path = os.path.join(output_dir, f"sample_{i}.wav")
-        gt_path = os.path.join(gt_dir, f"gt_sample_{i}.wav")
-        wav_paths.append(wav_path)
-        gt_paths.append(gt_path)
+        gen_path = os.path.join(output_dir, f"gen_sample_{sample_id}.mp3")
 
-        # Save ground-truth audio
-        try:
-            gt_audio = item["audio"]["array"]
-            gt_sr = item["audio"]["sampling_rate"]
-            torchaudio.save(gt_path, torch.tensor(gt_audio).unsqueeze(0), gt_sr)
-        except Exception as e:
-            logger.error(f"Error saving ground-truth audio {gt_path}: {e}")
-            continue
-
-        # Generate audio
-        try:
-            audio_stream = elevenlabs_tts(text)
-            audio_data = b""
-            for chunk in audio_stream:
-                audio_data += chunk
-
-            # Save MP3
-            with open(mp3_path, "wb") as f:
-                f.write(audio_data)
-
-            # Convert MP3 to WAV
-            waveform, sr = torchaudio.load(mp3_path)
-            torchaudio.save(wav_path, waveform, sr)
-        except Exception as e:
-            logger.error(f"Error generating/saving audio for sample {i}: {e}")
-            continue
-
-        tsv_data.append(f"{text}\tsample_{i}.wav\n")
-
-    if not tsv_data:
-        logger.error("No valid samples processed. Exiting.")
-        return
-
-    # Save TSV
-    tsv_path = "eval.tsv"
-    try:
-        with open(tsv_path, "w") as f:
-            f.writelines(tsv_data)
-        logger.info(f"Saved TSV to {tsv_path}")
-    except Exception as e:
-        logger.error(f"Error saving TSV: {e}")
-        return
+        # Generate audio if it doesn't exist
+        if not os.path.exists(gen_path):
+            try:
+                logger.info(f"Generating audio for sample {sample_id}...")
+                audio_stream = elevenlabs_tts(text)
+                with open(gen_path, "wb") as f:
+                    for chunk in audio_stream:
+                        if chunk:
+                            f.write(chunk)
+            except Exception as e:
+                logger.error(f"Failed to generate audio for sample {sample_id}: {e}")
+                continue
+        
+        evaluation_data.append({"text": text, "gt_path": gt_path, "gen_path": gen_path, "id": sample_id})
 
     # Step 4: Compute metrics
     try:
-        whisper = pipeline("automatic-speech-recognition", model="openai/whisper-small", 
-                          device=0 if device == "mps" or device == "cuda" else -1)
-        predictor = torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True)
+        whisper = pipeline("automatic-speech-recognition", model="openai/whisper-small", device=device)
+        predictor = torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).to(device)
     except Exception as e:
-        logger.error(f"Error initializing MOS/Whisper tools: {e}")
+        logger.error(f"Error initializing MOS/Whisper models: {e}")
         return
 
-    # Note: CLVP and Intelligibility skipped due to missing clvp.pth
-    logger.warning(
-        "Skipping CLVP and Intelligibility metrics due to missing clvp.pth. "
-        "Obtain from https://github.com/neonbjb/tts-scores or contact maintainer."
-    )
-
-    # Predicted MOS
-    mos_scores = []
-    for wav_path in wav_paths:
+    all_metrics = []
+    for data in evaluation_data:
+        gen_path = data["gen_path"]
+        gt_path = data["gt_path"]
+        gt_text = data["text"]
+        
+        # Predicted MOS
         try:
-            waveform, sr = torchaudio.load(wav_path)
-            mos = predictor(waveform, sr=sr)
-            mos_scores.append(mos.item())
+            waveform, sr = torchaudio.load(gen_path)
+            mos = predictor(waveform.to(device), sr=sr).item()
         except Exception as e:
-            logger.error(f"Error computing MOS for {wav_path}: {e}")
-            mos_scores.append(float('inf'))
-    avg_mos = sum([s for s in mos_scores if s != float('inf')]) / max(len(mos_scores), 1)
-    logger.info(f"Average Predicted MOS: {avg_mos}")
+            logger.error(f"Error computing MOS for {gen_path}: {e}")
+            mos = float('nan')
 
-    # WER and Classification Metrics
-    wer_scores = []
-    classification_results = []
-    for i, item in enumerate([item for _, item in valid_samples]):
+        # WER and Classification Metrics
         try:
-            wav_path = wav_paths[i]
-            pred_text = whisper(wav_path)["text"].strip().lower()
-            gt_text = item["text"].strip().lower()
+            pred_text = whisper(gen_path)["text"]
             wer_score = wer(gt_text, pred_text)
-            wer_scores.append(wer_score)
-            # Compute TP, FP, FN, TN
-            metrics = compute_classification_metrics(gt_text, pred_text)
-            classification_results.append(metrics)
+            class_metrics = compute_classification_metrics(gt_text, pred_text)
         except Exception as e:
-            logger.error(f"Error computing WER/classification for sample {i}: {e}")
-            wer_scores.append(float('inf'))
-            classification_results.append({
-                "tp": 0, "fp": 0, "fn": 0, "tn": 0,
-                "precision": 0, "recall": 0, "f1": 0
-            })
-    avg_wer = sum([s for s in wer_scores if s != float('inf')]) / max(len(wer_scores), 1)
-    logger.info(f"Average WER: {avg_wer}")
+            logger.error(f"Error computing WER for {gen_path}: {e}")
+            wer_score = float('inf')
+            class_metrics = {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "precision": 0, "recall": 0, "f1": 0}
 
-    # Aggregate classification metrics
-    total_tp = sum(r["tp"] for r in classification_results)
-    total_fp = sum(r["fp"] for r in classification_results)
-    total_fn = sum(r["fn"] for r in classification_results)
-    total_tn = sum(r["tn"] for r in classification_results)
-    avg_precision = sum(r["precision"] for r in classification_results) / max(len(classification_results), 1)
-    avg_recall = sum(r["recall"] for r in classification_results) / max(len(classification_results), 1)
-    avg_f1 = sum(r["f1"] for r in classification_results) / max(len(classification_results), 1)
-    logger.info(f"Classification Metrics: TP={total_tp}, FP={total_fp}, FN={total_fn}, TN={total_tn}, "
-                f"Precision={avg_precision:.3f}, Recall={avg_recall:.3f}, F1={avg_f1:.3f}")
-
-    # MCD
-    mcd_scores = []
-    for gt_path, wav_path in zip(gt_paths, wav_paths):
+        # MCD
         try:
-            mcd = compute_mcd(gt_path, wav_path, sr=22050)
-            mcd_scores.append(mcd)
+            mcd_score = compute_mcd(gt_path, gen_path)
         except Exception as e:
-            logger.error(f"Error computing MCD for {gt_path}, {wav_path}: {e}")
-            mcd_scores.append(float('inf'))
-    avg_mcd = sum([s for s in mcd_scores if s != float('inf')]) / max(len(mcd_scores), 1)
-    logger.info(f"Average MCD: {avg_mcd}")
+            logger.error(f"Error computing MCD for {gt_path}, {gen_path}: {e}")
+            mcd_score = float('inf')
+            
+        current_metrics = {
+            "mos": mos, "wer": wer_score, "mcd": mcd_score, **class_metrics
+        }
+        all_metrics.append(current_metrics)
 
-    # Save results to CSV
-    results = pd.DataFrame({
-        "Metric": ["CLVP", "Intelligibility", "MOS", "WER", "MCD", 
-                   "True Positives", "False Positives", "False Negatives", "True Negatives",
-                   "Precision", "Recall", "F1-Score"],
-        "Value": [float('inf'), float('inf'), avg_mos, avg_wer, avg_mcd,
-                  total_tp, total_fp, total_fn, total_tn,
-                  avg_precision, avg_recall, avg_f1]
+    # Aggregate and save results
+    results_df = pd.DataFrame(all_metrics)
+    avg_results = results_df.mean()
+    sum_results = results_df[["tp", "fp", "fn", "tn"]].sum()
+
+    final_report = pd.DataFrame({
+        "Metric": ["MOS", "WER", "MCD",
+                   "True Positives", "False Positives", "False Negatives",
+                   "Precision (Avg)", "Recall (Avg)", "F1-Score (Avg)"],
+        "Value": [avg_results.get("mos"), avg_results.get("wer"), avg_results.get("mcd"),
+                  sum_results.get("tp"), sum_results.get("fp"), sum_results.get("fn"),
+                  avg_results.get("precision"), avg_results.get("recall"), avg_results.get("f1")]
     })
+
     csv_path = "evaluation_results.csv"
     try:
-        results.to_csv(csv_path, index=False)
+        final_report.to_csv(csv_path, index=False)
         logger.info(f"Results saved to {csv_path}")
+        print("\n--- Evaluation Summary ---")
+        print(final_report)
+        print("------------------------")
     except Exception as e:
         logger.error(f"Error saving results: {e}")
 
